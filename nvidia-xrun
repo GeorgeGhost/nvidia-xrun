@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 DRY_RUN=0
 function printHelp {
@@ -10,7 +10,7 @@ function printHelp {
 }
 
 function execute {
-  if [[ ${DRY_RUN} -eq 1 ]]
+  if [ $DRY_RUN -eq 1 ]
     then
     echo ">>Dry run. Command: $*"
   else
@@ -18,127 +18,71 @@ function execute {
   fi
 }
 
-function turn_off_gpu {
-  if [[ "$REMOVE_DEVICE" == '1' ]]; then
-    echo 'Removing Nvidia bus from the kernel'
-    execute "sudo tee /sys/bus/pci/devices/${DEVICE_BUS_ID}/remove <<<1"
-  else
-    echo 'Enabling powersave for the graphic card'
-    execute "sudo tee /sys/bus/pci/devices/${DEVICE_BUS_ID}/power/control <<<auto"
-  fi
-
-  echo 'Enabling powersave for the PCIe controller'
-  execute "sudo tee /sys/bus/pci/devices/${CONTROLLER_BUS_ID}/power/control <<<auto"
-}
-
-function turn_on_gpu {
-  echo 'Turning the PCIe controller on to allow card rescan'
-  execute "sudo tee /sys/bus/pci/devices/${CONTROLLER_BUS_ID}/power/control <<<on"
-
-  echo 'Waiting 1 second'
-  execute "sleep 1"
-
-  if [[ ! -d /sys/bus/pci/devices/${DEVICE_BUS_ID} ]]; then
-    echo 'Rescanning PCI devices'
-    execute "sudo tee /sys/bus/pci/rescan <<<1"
-    echo "Waiting ${BUS_RESCAN_WAIT_SEC} second for rescan"
-    execute "sleep ${BUS_RESCAN_WAIT_SEC}"
-  fi
-
-  echo 'Turning the card on'
-  execute "sudo tee /sys/bus/pci/devices/${DEVICE_BUS_ID}/power/control <<<on"
-}
-
-function load_modules {
-  for module in "${MODULES_LOAD[@]}"
-  do
-    echo "Loading module ${module}"
-    execute "sudo modprobe ${module}"
-  done
-}
-
-function unload_modules {
-  for module in "${MODULES_UNLOAD[@]}"
-  do
-    echo "Unloading module ${module}"
-    execute "sudo modprobe -r ${module}"
-  done
-}
-
-if [[ "$1" == "-d" ]]
+if [ "$1" == "-d" ]
   then
     DRY_RUN=1
     shift 1
 fi
 
-# load config file
-. /etc/default/nvidia-xrun
-
-# this is used by the systemd service to turn off the gpu at boot
-if [[ "$TURN_OFF_GPU_ONLY" == '1' ]]; then
-  turn_off_gpu && exit 0
+## check if script is running through sudo/su or directly from root user
+if [[ ${SUDO_USER:-$USER} == "root" ]]; then
+   if [[ "$SUDO_USER" == "" ]]; then	
+      echo "Do not run it direclty from root user!";
+      echo "Run it from a normal user and use sudo or su instead.";
+   fi
+   exit 1;
 fi
 
-if [[ $EUID -eq 0 ]]; then
-   echo "This script must not be run as root unless TURN_OFF_GPU_ONLY=1 is set" >&2
-   exit 1
+## check if script is running through X
+if [[ $DISPLAY != "" && `tty` == "/dev/pts/0" ]]; then
+   execute "sudo -i openvt -s nvidia-xrun $*"
+   if [[ $DRY_RUN == "1" ]]; then
+      exit 0;
+   fi
 fi
 
-# calculate current VT
-LVT=`fgconsole`
-
-# calculate first usable display
-XNUM="-1"
-SOCK="something"
-while [[ ! -z "$SOCK" ]]
-do
-  XNUM=$(( $XNUM + 1 ))
-  SOCK=$(ls -A -1 /tmp/.X11-unix | grep "X$XNUM" )
-done
-
-NEWDISP=":$XNUM"
-
-if [[ ! -z "$*" ]] # generate exec line if arguments are given
-then
-  # test if executable exists in path
-  if [[ -x "$(which $1 2> /dev/null)" ]]
-  then
-    # generate exec line
-    EXECL="$(which $1)"
-  # test if executable exists on disk
-  elif [[ -e "$(realpath "$1")" ]]
-  then
-    # generate exec line
-    EXECL="$(realpath "$1")"
-  else
-    echo "$1: No such executable!"
-    exit 1
-  fi
-  shift 1
-  EXECL="$EXECL $*"
-else # prepare to start new X sessions if no arguments passed
-  EXECL=""
+## check if does have necessary permission
+if [[ $EUID != "0" ]]; then
+   execute "sudo -i nvidia-xrun $*"
+   exit 0;
 fi
 
-EXECL="/etc/X11/xinit/nvidia-xinitrc \"$EXECL\""
+## check current vt in use
+[[ $(< '/sys/class/tty/tty0/active') =~ tty([0-9]{1,}) ]]
+LVT=${BASH_REMATCH[1]}
 
-COMMAND="xinit $EXECL -- $NEWDISP vt$LVT -nolisten tcp -br -config nvidia-xorg.conf -configdir nvidia-xorg.conf.d"
 
-# --------- TURNING ON GPU -----------
-if [[ "$ENABLE_PM" == '1' ]]; then
-  turn_on_gpu
-fi
 
-# ---------- LOADING MODULES ----------
-load_modules
+echo 'Waking up nvidia GPU'
+execute "sudo tee /proc/acpi/bbswitch <<<ON"
 
-# ---------- EXECUTING COMMAND --------
-execute ${COMMAND}
+echo 'Loading nvidia module'
+execute "sudo modprobe nvidia"
 
-# ---------- UNLOADING MODULES --------
-unload_modules
+echo 'Loading nvidia_drm module'
+execute "sudo modprobe nvidia_drm"
 
-# --------- TURNING OFF GPU ----------
-if [[ "$ENABLE_PM" == '1' ]]; then
-  turn_off_gpu
-fi
+
+
+echo 'Executing the nvidia-xrun-core'
+execute "sudo -i -u ${SUDO_USER:-$USER} nvidia-xrun-core $*"
+
+
+
+echo 'Unloading nvidia_drm module'
+execute "sudo rmmod nvidia_drm"
+
+echo 'Unloading nvidia_modeset module'
+execute "sudo rmmod nvidia_modeset"
+
+echo 'Unloading nvidia module'
+execute "sudo rmmod nvidia"
+
+echo 'Turning off nvidia GPU'
+execute "sudo tee /proc/acpi/bbswitch <<<OFF"
+
+echo -n 'Current state of nvidia GPU: '
+execute "cat /proc/acpi/bbswitch"
+
+## change to the previous vt
+chvt $LVT
